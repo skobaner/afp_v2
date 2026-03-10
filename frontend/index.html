@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AFP Platform Console</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Instrument+Serif:ital@0;1&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">AFP Data Platform</p>
+          <h1>Cycle Operations Console</h1>
+          <p class="subhead">
+            Upload, process, review, and certify AFP cycles. All data stays in the API and SQL backend.
+          </p>
+        </div>
+        <div class="api-box">
+          <label for="apiBase">API Base URL</label>
+          <div class="api-row">
+            <input id="apiBase" type="text" placeholder="https://api-...azurewebsites.net" />
+            <button id="saveApi" class="btn ghost">Save</button>
+          </div>
+          <p class="hint">Stored locally in this browser. Leave blank to use the current origin.</p>
+        </div>
+      </header>
+
+      <section class="card">
+        <div class="card-header">
+          <h2>Upload Cycle Package</h2>
+          <p>Upload the three cycle files (ERP Actuals, ITB Cost Performance, Invoice Information) and process the cycle.</p>
+        </div>
+        <div class="grid-2">
+          <div>
+            <label for="cycleId">ITB / Cycle ID</label>
+            <input id="cycleId" type="text" placeholder="ITB_SAN_01" />
+          </div>
+          <div class="actions">
+            <button id="processCycle" class="btn">Process Cycle</button>
+          </div>
+        </div>
+        <div class="grid-3">
+          <div>
+            <label>Invoice Information CSV</label>
+            <input id="invoiceFile" type="file" accept=".csv" />
+            <button id="uploadInvoice" class="btn ghost">Upload Invoice</button>
+          </div>
+          <div>
+            <label>ERP Actuals CSV</label>
+            <input id="erpFile" type="file" accept=".csv" />
+            <button id="uploadErp" class="btn ghost">Upload ERP</button>
+          </div>
+          <div>
+            <label>ITB Cost Performance CSV</label>
+            <input id="itbFile" type="file" accept=".csv" />
+            <button id="uploadItb" class="btn ghost">Upload ITB</button>
+          </div>
+        </div>
+        <div class="status" id="cycleStatus"></div>
+      </section>
+
+      <section class="card">
+        <div class="card-header">
+          <h2>Upload Static Tables</h2>
+          <p>Upload PO master data.</p>
+        </div>
+        <div class="grid-2">
+          <div>
+            <label>PO Master CSV</label>
+            <input id="poFile" type="file" accept=".csv" />
+          </div>
+          <div class="actions">
+            <button id="uploadPo" class="btn">Upload PO Master</button>
+          </div>
+        </div>
+        <div class="status" id="staticStatus"></div>
+      </section>
+
+      <section class="card">
+        <div class="card-header">
+          <h2>View Inputs</h2>
+          <p>Inspect the raw input tables for a specific cycle.</p>
+        </div>
+        <div class="grid-3">
+          <div>
+            <label for="inputCycle">ITB / Cycle ID</label>
+            <input id="inputCycle" type="text" placeholder="ITB_SAN_01" />
+          </div>
+          <div>
+            <label for="inputTable">Input Table</label>
+            <select id="inputTable">
+              <option value="invoices">Invoice Information</option>
+              <option value="erp">ERP Actuals</option>
+              <option value="itb">ITB Cost Performance</option>
+            </select>
+          </div>
+          <div class="actions">
+            <button id="loadInput" class="btn">Load Input</button>
+          </div>
+        </div>
+        <div class="table-wrap" id="inputTableWrap"></div>
+      </section>
+
+      <section class="card">
+        <div class="card-header">
+          <h2>View Processed Results</h2>
+          <p>Inspect processed tables after certification logic is applied.</p>
+        </div>
+        <div class="grid-3">
+          <div>
+            <label for="txnCycle">ITB / Cycle ID</label>
+            <input id="txnCycle" type="text" placeholder="ITB_SAN_01" />
+          </div>
+          <div>
+            <label for="txnTable">Processed Table</label>
+            <select id="txnTable">
+              <option value="invoices">Invoice Transactions</option>
+              <option value="erp">ERP Transactions</option>
+              <option value="itb">ITB Cost Performance</option>
+            </select>
+          </div>
+          <div class="actions">
+            <button id="loadTxn" class="btn">Load Results</button>
+          </div>
+        </div>
+        <div class="table-wrap" id="txnTableWrap"></div>
+      </section>
+
+      <section class="card">
+        <div class="card-header">
+          <h2>Certification Review</h2>
+          <p>Approve or adjust certified amounts at row level. Updates recalc ITB totals.</p>
+        </div>
+        <div class="grid-2">
+          <div>
+            <label for="certCycle">ITB / Cycle ID</label>
+            <input id="certCycle" type="text" placeholder="ITB_SAN_01" />
+          </div>
+          <div class="actions">
+            <button id="loadCerts" class="btn">Load ERP Transactions</button>
+          </div>
+        </div>
+        <div class="table-wrap" id="certTableWrap"></div>
+      </section>
+
+      <section class="card">
+        <div class="card-header">
+          <h2>Admin Query (Read-only)</h2>
+          <p>Run SELECT queries with row limits. No writes allowed.</p>
+        </div>
+        <textarea id="adminSql" rows="5" placeholder="SELECT TOP 50 * FROM dbo.txn_erp_actuals"></textarea>
+        <div class="actions">
+          <button id="runQuery" class="btn">Run Query</button>
+        </div>
+        <div class="table-wrap" id="queryTableWrap"></div>
+      </section>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>

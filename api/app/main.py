@@ -6,7 +6,9 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 
 app = FastAPI(title="AFP Data Platform API", version="2.0.0")
 APP_ROOT = Path(__file__).resolve().parent
@@ -15,6 +17,30 @@ SCHEMA_PATH = APP_ROOT.parents[2] / "sql" / "schema.sql"
 
 CERT_OVERHEAD_RATE = Decimal("0.151")
 CERT_PROFIT_RATE = Decimal("0.132")
+
+CORS_ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "*")
+if CORS_ALLOW_ORIGINS.strip() == "*":
+  cors_origins = ["*"]
+else:
+  cors_origins = [origin.strip() for origin in CORS_ALLOW_ORIGINS.split(",") if origin.strip()]
+
+app.add_middleware(
+  CORSMiddleware,
+  allow_origins=cors_origins,
+  allow_credentials=True,
+  allow_methods=["*"],
+  allow_headers=["*"],
+)
+
+
+class AdminQueryRequest(BaseModel):
+  sql: str = Field(..., min_length=1)
+  max_rows: int = Field(default=500, ge=1, le=5000)
+
+
+class CertificationUpdate(BaseModel):
+  certified_without_fee: float = Field(..., ge=0)
+  certification_status: str | None = None
 
 
 def _required_env(name: str) -> str:
@@ -45,6 +71,28 @@ def _get(row: dict[str, str], *keys: str, default: str = "") -> str:
     if k in row:
       return row[k]
   return default
+
+
+def _validate_readonly_sql(sql: str) -> str:
+  normalized = " ".join(sql.strip().split())
+  if not normalized:
+    raise HTTPException(status_code=400, detail="SQL query cannot be empty")
+
+  lowered = normalized.lower()
+  if not (lowered.startswith("select ") or lowered.startswith("with ")):
+    raise HTTPException(status_code=400, detail="Only SELECT queries are allowed")
+
+  forbidden = [
+    "insert ", "update ", "delete ", "merge ", "drop ", "alter ", "create ",
+    "truncate ", "execute ", "exec ", "grant ", "revoke ", "deny ",
+  ]
+  if any(token in lowered for token in forbidden):
+    raise HTTPException(status_code=400, detail="Only read-only queries are allowed")
+
+  if ";" in lowered:
+    raise HTTPException(status_code=400, detail="Multiple statements are not allowed")
+
+  return normalized
 
 
 def get_sql_connection():
@@ -768,3 +816,163 @@ def get_itb_line_master(limit: int = Query(default=200, ge=1, le=5000)):
       cursor.execute("SELECT TOP (%s) * FROM dbo.itb_line_master ORDER BY ln_itm_id", (limit,))
       rows = cursor.fetchall()
   return {"count": len(rows), "records": rows}
+
+
+@app.get("/input/invoices")
+def get_input_invoices(itb_no: str = Query(...)):
+  ensure_schema_exists()
+  with get_sql_connection() as conn:
+    with conn.cursor() as cursor:
+      cursor.execute("SELECT * FROM dbo.input_invoice_information WHERE itb_no = %s", (itb_no,))
+      rows = cursor.fetchall()
+  return {"count": len(rows), "records": rows}
+
+
+@app.get("/input/erp")
+def get_input_erp(itb_no: str = Query(...)):
+  ensure_schema_exists()
+  with get_sql_connection() as conn:
+    with conn.cursor() as cursor:
+      cursor.execute("SELECT * FROM dbo.input_erp_actuals WHERE itb_no = %s", (itb_no,))
+      rows = cursor.fetchall()
+  return {"count": len(rows), "records": rows}
+
+
+@app.get("/input/itb")
+def get_input_itb(itb_no: str = Query(...)):
+  ensure_schema_exists()
+  with get_sql_connection() as conn:
+    with conn.cursor() as cursor:
+      cursor.execute("SELECT * FROM dbo.input_itb_cost_performance WHERE itb_no = %s", (itb_no,))
+      rows = cursor.fetchall()
+  return {"count": len(rows), "records": rows}
+
+
+@app.post("/admin/query")
+def admin_query(request: AdminQueryRequest):
+  ensure_schema_exists()
+  sql = _validate_readonly_sql(request.sql)
+  max_rows = request.max_rows
+
+  with get_sql_connection() as conn:
+    with conn.cursor() as cursor:
+      cursor.execute("SET ROWCOUNT %s", (max_rows,))
+      cursor.execute(sql)
+      rows = cursor.fetchall()
+      cursor.execute("SET ROWCOUNT 0")
+
+  return {"count": len(rows), "records": rows}
+
+
+@app.patch("/txn/erp/{row_id}/certification")
+def update_erp_certification(row_id: int, payload: CertificationUpdate):
+  ensure_schema_exists()
+  certified_without_fee = Decimal(str(payload.certified_without_fee))
+  if certified_without_fee < 0:
+    raise HTTPException(status_code=400, detail="Certified amount must be >= 0")
+
+  certified_overhead = (certified_without_fee * CERT_OVERHEAD_RATE).quantize(Decimal("0.01"))
+  certified_profit = (certified_without_fee * CERT_PROFIT_RATE).quantize(Decimal("0.01"))
+  certified_amount_w_fee = certified_without_fee + certified_overhead + certified_profit
+
+  with get_sql_connection() as conn:
+    with conn.cursor() as cursor:
+      cursor.execute(
+        "SELECT itb_no, ln_itm_id FROM dbo.txn_erp_actuals WHERE id = %s",
+        (row_id,),
+      )
+      row = cursor.fetchone()
+      if not row:
+        raise HTTPException(status_code=404, detail="ERP transaction not found")
+
+      itb_no = row.get("itb_no")
+      ln_itm_id = row.get("ln_itm_id")
+      status = payload.certification_status or "certified"
+
+      cursor.execute(
+        """
+        UPDATE dbo.txn_erp_actuals
+        SET certified_without_fee = %s,
+            certified_overhead = %s,
+            certified_profit = %s,
+            certified_amount_w_fee = %s,
+            certification_status = %s,
+            processed_at = SYSUTCDATETIME()
+        WHERE id = %s
+        """,
+        (
+          float(certified_without_fee),
+          float(certified_overhead),
+          float(certified_profit),
+          float(certified_amount_w_fee),
+          status,
+          row_id,
+        ),
+      )
+
+      cursor.execute(
+        """
+        SELECT
+          SUM(COALESCE(submitted_acwp, 0)) AS submitted_actual_cost,
+          SUM(COALESCE(certified_without_fee, 0)) AS certified_actual_cost
+        FROM dbo.txn_erp_actuals
+        WHERE itb_no = %s AND ln_itm_id = %s
+        """,
+        (itb_no, ln_itm_id),
+      )
+      totals = cursor.fetchone() or {}
+      submitted_actual_cost = Decimal(str(totals.get("submitted_actual_cost") or 0))
+      certified_actual_cost = Decimal(str(totals.get("certified_actual_cost") or 0))
+
+      cursor.execute(
+        """
+        UPDATE dbo.txn_itb_cost_performance
+        SET submitted_actual_cost_calc = %s,
+            certified_actual_cost = %s
+        WHERE itb_no = %s AND ln_itm_id = %s
+        """,
+        (float(submitted_actual_cost), float(certified_actual_cost), itb_no, ln_itm_id),
+      )
+
+      cursor.execute(
+        """
+        SELECT SUM(COALESCE(certified_actual_cost, 0)) AS ltd
+        FROM dbo.txn_itb_cost_performance
+        WHERE ln_itm_id = %s
+        """,
+        (ln_itm_id,),
+      )
+      ltd_row = cursor.fetchone() or {}
+      ltd_total = Decimal(str(ltd_row.get("ltd") or 0))
+
+      cursor.execute(
+        """
+        UPDATE dbo.txn_itb_cost_performance
+        SET ltd_certified_with_current_afp = %s
+        WHERE itb_no = %s AND ln_itm_id = %s
+        """,
+        (float(ltd_total), itb_no, ln_itm_id),
+      )
+
+      cursor.execute(
+        """
+        UPDATE dbo.itb_line_master
+        SET ltd_certified_with_current_afp = %s,
+            updated_at = SYSUTCDATETIME()
+        WHERE ln_itm_id = %s
+        """,
+        (float(ltd_total), ln_itm_id),
+      )
+
+    conn.commit()
+
+  return {
+    "message": "Certification updated",
+    "id": row_id,
+    "itb_no": itb_no,
+    "ln_itm_id": ln_itm_id,
+    "certified_without_fee": float(certified_without_fee),
+    "certified_overhead": float(certified_overhead),
+    "certified_profit": float(certified_profit),
+    "certified_amount_w_fee": float(certified_amount_w_fee),
+  }

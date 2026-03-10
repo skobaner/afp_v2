@@ -7,6 +7,7 @@ on:
     paths:
       - "api/**"
       - "pipeline/**"
+      - "frontend/**"
       - ".github/workflows/deploy-apps.yml"
 
 concurrency:
@@ -63,6 +64,7 @@ jobs:
           echo "resource_group=$(terraform output -raw resource_group_name)" >> "$GITHUB_OUTPUT"
           echo "api_app=$(terraform output -raw api_app_name)" >> "$GITHUB_OUTPUT"
           echo "function_app=$(terraform output -raw function_app_name)" >> "$GITHUB_OUTPUT"
+          echo "frontend_app=$(terraform output -raw frontend_app_name)" >> "$GITHUB_OUTPUT"
 
       - name: Build Function zip
         run: |
@@ -128,5 +130,39 @@ jobs:
           done
           if [ "$success" -ne 1 ]; then
             echo "API deployment failed after 8 attempts."
+            exit 1
+          fi
+
+      - name: Build Frontend zip
+        run: |
+          cd frontend
+          zip -r ../frontend.zip . -x "*__pycache__*" "*.DS_Store*"
+
+      - name: Deploy Frontend zip
+        run: |
+          success=0
+          for attempt in {1..8}; do
+            set +e
+            output=$(timeout 600 az webapp deployment source config-zip \
+              --resource-group "${{ steps.tfout.outputs.resource_group }}" \
+              --name "${{ steps.tfout.outputs.frontend_app }}" \
+              --src frontend.zip 2>&1)
+            exit_code=$?
+            set -e
+            echo "$output"
+            if [ "$exit_code" -eq 0 ]; then
+              echo "Frontend deployment succeeded"
+              success=1
+              break
+            fi
+            if [ "$exit_code" -eq 124 ] || echo "$output" | grep -Eq "(Status Code: (400|409|504)|Another deployment is in progress)"; then
+              echo "Transient Kudu deployment collision/timeout (attempt $attempt/8). Retrying..."
+              sleep 45
+              continue
+            fi
+            exit "$exit_code"
+          done
+          if [ "$success" -ne 1 ]; then
+            echo "Frontend deployment failed after 8 attempts."
             exit 1
           fi

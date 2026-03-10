@@ -15,6 +15,7 @@ locals {
   app_service_plan     = "asp-${local.base_name}"
   api_app_name         = "api-${local.base_name}"
   function_app_name    = "func-${local.base_name}"
+  frontend_app_name    = "web-${local.base_name}"
   tags = {
     project     = var.project_name
     environment = var.environment
@@ -120,6 +121,26 @@ resource "azurerm_linux_web_app" "api" {
     SQL_DATABASE = azurerm_mssql_database.main.name
     SQL_USER     = var.sql_admin_username
     SQL_PASSWORD = var.sql_admin_password
+    CORS_ALLOW_ORIGINS = "*"
+  }
+
+  tags = local.tags
+}
+
+resource "azurerm_linux_web_app" "frontend" {
+  name                = local.frontend_app_name
+  resource_group_name = azurerm_resource_group.main.name
+  location            = azurerm_resource_group.main.location
+  service_plan_id     = azurerm_service_plan.main.id
+
+  site_config {
+    always_on = false
+  }
+
+  app_settings = {
+    WEBSITES_ENABLE_APP_SERVICE_STORAGE = "true"
+    SCM_DO_BUILD_DURING_DEPLOYMENT      = "false"
+    API_BASE_URL                        = "https://${azurerm_linux_web_app.api.default_hostname}"
   }
 
   tags = local.tags

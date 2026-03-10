@@ -29,3 +29,11 @@ output "api_app_url" {
 output "function_app_name" {
   value = azurerm_linux_function_app.pipeline.name
 }
+
+output "frontend_app_name" {
+  value = azurerm_linux_web_app.frontend.name
+}
+
+output "frontend_app_url" {
+  value = "https://${azurerm_linux_web_app.frontend.default_hostname}"
+}
