@@ -88,17 +88,37 @@ def _parse_date(value: str | None, field_name: str):
   if raw == "":
     return None
 
-  formats = ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%m/%d/%y", "%d-%b-%y")
+  cleaned = raw.replace(",", " ").strip()
+  cleaned = cleaned.replace("  ", " ")
+  for suffix in ("st", "nd", "rd", "th"):
+    cleaned = cleaned.replace(suffix + " ", " ")
+
+  formats = (
+    "%Y-%m-%d",
+    "%m/%d/%Y",
+    "%d/%m/%Y",
+    "%m/%d/%y",
+    "%d-%b-%y",
+    "%B %d %Y",
+    "%b %d %Y",
+  )
   for fmt in formats:
     try:
       return datetime.strptime(raw, fmt).date()
+    except ValueError:
+      pass
+    try:
+      return datetime.strptime(cleaned, fmt).date()
     except ValueError:
       continue
 
   try:
     return datetime.fromisoformat(raw).date()
   except ValueError:
-    raise HTTPException(status_code=400, detail=f"Invalid date value for {field_name}: {value}")
+    try:
+      return datetime.fromisoformat(cleaned).date()
+    except ValueError:
+      raise HTTPException(status_code=400, detail=f"Invalid date value for {field_name}: {value}")
 
 
 def _validate_readonly_sql(sql: str) -> str:
