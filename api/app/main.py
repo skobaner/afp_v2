@@ -1,78 +1,20 @@
 import csv
 import io
 import os
-from pathlib import Path
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from uuid import uuid4
+from pathlib import Path
 
-from azure.core.exceptions import AzureError, ResourceNotFoundError
-from azure.storage.blob import BlobServiceClient
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 
-app = FastAPI(title="AFP Data Platform API", version="1.2.0")
+app = FastAPI(title="AFP Data Platform API", version="2.0.0")
 APP_ROOT = Path(__file__).resolve().parent
 STATIC_DIR = APP_ROOT / "static"
+SCHEMA_PATH = APP_ROOT.parents[2] / "sql" / "schema.sql"
 
-SCHEMA_DDL = """
-IF OBJECT_ID(N'dbo.po_limits', N'U') IS NULL
-BEGIN
-  CREATE TABLE dbo.po_limits (
-    po NVARCHAR(100) NOT NULL PRIMARY KEY,
-    po_value DECIMAL(18,2) NOT NULL,
-    total_claimed DECIMAL(18,2) NOT NULL CONSTRAINT DF_po_limits_total_claimed DEFAULT (0),
-    updated_at DATETIME2(3) NOT NULL CONSTRAINT DF_po_limits_updated_at DEFAULT SYSUTCDATETIME()
-  );
-END;
-
-IF OBJECT_ID(N'dbo.category_limits', N'U') IS NULL
-BEGIN
-  CREATE TABLE dbo.category_limits (
-    category_id NVARCHAR(100) NOT NULL PRIMARY KEY,
-    category_limit DECIMAL(18,2) NOT NULL,
-    total_claimed DECIMAL(18,2) NOT NULL CONSTRAINT DF_category_limits_total_claimed DEFAULT (0),
-    updated_at DATETIME2(3) NOT NULL CONSTRAINT DF_category_limits_updated_at DEFAULT SYSUTCDATETIME()
-  );
-END;
-
-IF OBJECT_ID(N'dbo.application_payments_processed', N'U') IS NULL
-BEGIN
-  CREATE TABLE dbo.application_payments_processed (
-    id INT IDENTITY(1,1) PRIMARY KEY,
-    source_blob NVARCHAR(512) NOT NULL,
-    row_number INT NOT NULL,
-    project NVARCHAR(255) NOT NULL,
-    cost_category NVARCHAR(100) NOT NULL,
-    po NVARCHAR(100) NOT NULL,
-    cost_amount DECIMAL(18,2) NOT NULL,
-    certification NVARCHAR(32) NOT NULL,
-    certified_cost DECIMAL(18,2) NOT NULL,
-    po_remaining_before DECIMAL(18,2) NOT NULL,
-    category_remaining_before DECIMAL(18,2) NOT NULL,
-    error_message NVARCHAR(1000) NULL,
-    raw_payload NVARCHAR(MAX) NOT NULL,
-    processed_at DATETIME2(3) NOT NULL CONSTRAINT DF_app_payments_processed_at DEFAULT SYSUTCDATETIME(),
-    CONSTRAINT UQ_app_payments_source_row UNIQUE (source_blob, row_number)
-  );
-END;
-
-IF OBJECT_ID(N'dbo.application_payments_raw', N'U') IS NULL
-BEGIN
-  CREATE TABLE dbo.application_payments_raw (
-    id INT IDENTITY(1,1) PRIMARY KEY,
-    source_blob NVARCHAR(512) NOT NULL,
-    row_number INT NOT NULL,
-    project NVARCHAR(255) NULL,
-    cost_category NVARCHAR(100) NULL,
-    po NVARCHAR(100) NULL,
-    cost_amount DECIMAL(18,2) NULL,
-    raw_payload NVARCHAR(MAX) NOT NULL,
-    ingested_at DATETIME2(3) NOT NULL CONSTRAINT DF_app_payments_raw_ingested_at DEFAULT SYSUTCDATETIME(),
-    CONSTRAINT UQ_app_payments_raw_source_row UNIQUE (source_blob, row_number)
-  );
-END;
-"""
+CERT_OVERHEAD_RATE = Decimal("0.151")
+CERT_PROFIT_RATE = Decimal("0.132")
 
 
 def _required_env(name: str) -> str:
@@ -82,27 +24,27 @@ def _required_env(name: str) -> str:
   return value
 
 
-def _to_decimal(value: str, field_name: str) -> Decimal:
+def _to_decimal(value: str | None, field_name: str) -> Decimal:
   try:
     return Decimal(str(value).strip())
   except (InvalidOperation, ValueError, TypeError):
     raise HTTPException(status_code=400, detail=f"Invalid decimal value for {field_name}: {value}")
 
 
-def get_blob_client() -> BlobServiceClient:
-  connection_string = _required_env("BLOB_CONNECTION_STRING")
-  return BlobServiceClient.from_connection_string(connection_string)
+def _normalize_header(name: str) -> str:
+  return " ".join(str(name).strip().lower().split())
 
 
-def ensure_blob_container_exists(blob_service: BlobServiceClient, container_name: str) -> None:
-  container_client = blob_service.get_container_client(container_name)
-  try:
-    if not container_client.exists():
-      container_client.create_container()
-  except ResourceNotFoundError:
-    container_client.create_container()
-  except AzureError as exc:
-    raise HTTPException(status_code=500, detail="Unable to access blob storage container") from exc
+def _normalize_row(row: dict[str, str]) -> dict[str, str]:
+  return {_normalize_header(k): v for k, v in row.items()}
+
+
+def _get(row: dict[str, str], *keys: str, default: str = "") -> str:
+  for key in keys:
+    k = _normalize_header(key)
+    if k in row:
+      return row[k]
+  return default
 
 
 def get_sql_connection():
@@ -117,10 +59,17 @@ def get_sql_connection():
   )
 
 
+def _load_schema_sql() -> str:
+  if not SCHEMA_PATH.exists():
+    raise RuntimeError(f"Schema file not found: {SCHEMA_PATH}")
+  return SCHEMA_PATH.read_text(encoding="utf-8")
+
+
 def ensure_schema_exists() -> None:
+  ddl = _load_schema_sql()
   with get_sql_connection() as conn:
     with conn.cursor() as cursor:
-      cursor.execute(SCHEMA_DDL)
+      cursor.execute(ddl)
     conn.commit()
 
 
@@ -137,210 +86,685 @@ def ui_home():
   return FileResponse(index_file)
 
 
-@app.post("/upload-csv")
-async def upload_csv(file: UploadFile = File(...)):
+def _read_csv_upload(file: UploadFile) -> list[dict[str, str]]:
   if not file.filename.lower().endswith(".csv"):
     raise HTTPException(status_code=400, detail="Only .csv files are supported")
 
-  content = await file.read()
+  content = file.file.read()
   if not content:
     raise HTTPException(status_code=400, detail="Uploaded file is empty")
 
   try:
     decoded = content.decode("utf-8-sig")
-    reader = csv.reader(io.StringIO(decoded))
-    first_row = next(reader, None)
-    if first_row is None:
-      raise HTTPException(status_code=400, detail="CSV has no rows")
   except UnicodeDecodeError as exc:
     raise HTTPException(status_code=400, detail="CSV must be UTF-8 encoded") from exc
 
-  blob_service = get_blob_client()
-  container_name = _required_env("BLOB_CONTAINER_NAME")
-  blob_name = f"raw/{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid4()}-{file.filename}"
-
-  ensure_blob_container_exists(blob_service, container_name)
-  container_client = blob_service.get_container_client(container_name)
-  try:
-    container_client.upload_blob(name=blob_name, data=content, overwrite=False)
-  except AzureError as exc:
-    raise HTTPException(status_code=500, detail="Failed to upload file to blob storage") from exc
-
-  return {"message": "File uploaded successfully", "container": container_name, "blob": blob_name}
-
-
-@app.post("/seed/po-limits")
-async def seed_po_limits(file: UploadFile = File(...)):
-  ensure_schema_exists()
-  content = await file.read()
-  if not content:
-    raise HTTPException(status_code=400, detail="Uploaded file is empty")
-
-  decoded = content.decode("utf-8-sig")
   reader = csv.DictReader(io.StringIO(decoded))
-  expected = {"PO", "PO_value", "Total_Claimed"}
-  if not reader.fieldnames or not expected.issubset(set(reader.fieldnames)):
-    raise HTTPException(status_code=400, detail="PO limits CSV must include PO, PO_value, Total_Claimed")
+  if not reader.fieldnames:
+    raise HTTPException(status_code=400, detail="CSV has no headers")
 
-  merge_sql = """
-    MERGE dbo.po_limits AS target
-    USING (SELECT %s AS po) AS src
-    ON target.po = src.po
-    WHEN MATCHED THEN
-      UPDATE SET po_value = %s, total_claimed = %s, updated_at = SYSUTCDATETIME()
-    WHEN NOT MATCHED THEN
-      INSERT (po, po_value, total_claimed, updated_at)
-      VALUES (%s, %s, %s, SYSUTCDATETIME());
-  """
+  rows = []
+  for row in reader:
+    rows.append(_normalize_row(row))
+  if not rows:
+    raise HTTPException(status_code=400, detail="CSV has no data rows")
+  return rows
 
-  count = 0
+
+@app.post("/po-master")
+def upload_po_master(file: UploadFile = File(...)):
+  ensure_schema_exists()
+  rows = _read_csv_upload(file)
+
   with get_sql_connection() as conn:
     with conn.cursor() as cursor:
-      for row in reader:
-        po = (row.get("PO") or "").strip()
-        if not po:
+      for row in rows:
+        po_no = _get(row, "PO No")
+        if not po_no:
           continue
-        po_value = _to_decimal(row.get("PO_value"), "PO_value")
-        total_claimed = _to_decimal(row.get("Total_Claimed"), "Total_Claimed")
-        cursor.execute(merge_sql, (po, float(po_value), float(total_claimed), po, float(po_value), float(total_claimed)))
-        count += 1
-    conn.commit()
+        vendor = _get(row, "Vendor Name")
+        currency = _get(row, "Currency")
+        po_value_original = _get(row, "PO Value in Original Currency")
+        po_value_cad = _get(row, "Converted_PO_Value_in_CAD", "PO Value in Original CAD")
+        po_value_original_dec = _to_decimal(po_value_original or "0", "PO Value in Original Currency")
+        po_value_cad_dec = _to_decimal(po_value_cad or "0", "Converted_PO_Value_in_CAD")
 
-  return {"message": "PO limits seeded", "rows": count}
-
-
-@app.post("/seed/category-limits")
-async def seed_category_limits(file: UploadFile = File(...)):
-  ensure_schema_exists()
-  content = await file.read()
-  if not content:
-    raise HTTPException(status_code=400, detail="Uploaded file is empty")
-
-  decoded = content.decode("utf-8-sig")
-  reader = csv.DictReader(io.StringIO(decoded))
-  expected = {"Category_ID", "Category_Limit", "Total_Claimed"}
-  if not reader.fieldnames or not expected.issubset(set(reader.fieldnames)):
-    raise HTTPException(status_code=400, detail="Category limits CSV must include Category_ID, Category_Limit, Total_Claimed")
-
-  merge_sql = """
-    MERGE dbo.category_limits AS target
-    USING (SELECT %s AS category_id) AS src
-    ON target.category_id = src.category_id
-    WHEN MATCHED THEN
-      UPDATE SET category_limit = %s, total_claimed = %s, updated_at = SYSUTCDATETIME()
-    WHEN NOT MATCHED THEN
-      INSERT (category_id, category_limit, total_claimed, updated_at)
-      VALUES (%s, %s, %s, SYSUTCDATETIME());
-  """
-
-  count = 0
-  with get_sql_connection() as conn:
-    with conn.cursor() as cursor:
-      for row in reader:
-        category_id = (row.get("Category_ID") or "").strip()
-        if not category_id:
-          continue
-        category_limit = _to_decimal(row.get("Category_Limit"), "Category_Limit")
-        total_claimed = _to_decimal(row.get("Total_Claimed"), "Total_Claimed")
         cursor.execute(
-          merge_sql,
+          """
+          MERGE dbo.po_master AS target
+          USING (SELECT %s AS po_no) AS src
+          ON target.po_no = src.po_no
+          WHEN MATCHED THEN
+            UPDATE SET
+              vendor_name = %s,
+              currency = %s,
+              po_value_original = %s,
+              po_value_cad = %s,
+              remaining = CASE
+                WHEN po_value_cad IS NULL THEN remaining
+                ELSE po_value_cad - total_claimed
+              END,
+              updated_at = SYSUTCDATETIME()
+          WHEN NOT MATCHED THEN
+            INSERT (po_no, vendor_name, currency, po_value_original, po_value_cad, total_claimed, remaining, updated_at)
+            VALUES (%s, %s, %s, %s, %s, 0, %s, SYSUTCDATETIME());
+          """,
           (
-            category_id,
-            float(category_limit),
-            float(total_claimed),
-            category_id,
-            float(category_limit),
-            float(total_claimed),
+            po_no,
+            vendor or None,
+            currency or None,
+            float(po_value_original_dec),
+            float(po_value_cad_dec),
+            po_no,
+            vendor or None,
+            currency or None,
+            float(po_value_original_dec),
+            float(po_value_cad_dec),
+            float(po_value_cad_dec),
           ),
         )
-        count += 1
     conn.commit()
 
-  return {"message": "Category limits seeded", "rows": count}
+  return {"message": "PO master updated", "rows": len(rows)}
 
 
-@app.get("/po-limits")
-def get_po_limits():
+@app.post("/cycles/{itb_no}/upload/itb-cost-performance")
+def upload_itb_cost_performance(itb_no: str, file: UploadFile = File(...)):
   ensure_schema_exists()
+  rows = _read_csv_upload(file)
+
   with get_sql_connection() as conn:
     with conn.cursor() as cursor:
-      cursor.execute("SELECT po, po_value, total_claimed, updated_at FROM dbo.po_limits ORDER BY po")
-      rows = cursor.fetchall()
-  return {"count": len(rows), "records": rows}
+      for row in rows:
+        ln_itm_id = _get(row, "Ln_ITM_ID")
+        if not ln_itm_id:
+          continue
+
+        cursor.execute(
+          """
+          INSERT INTO dbo.input_itb_cost_performance (
+            itb_no, ln_itm_id, bundle_id, cbs_1, cbs_2, cbs_3, cbs_4, cbs_5, cost_type,
+            submitted_actual_cost, submitted_1_fc, submitted_2_fc, submitted_3_fc, variance_current_submission
+          )
+          VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+          """,
+          (
+            itb_no,
+            ln_itm_id,
+            _get(row, "Bundle_ID") or None,
+            _get(row, "CBS_1") or None,
+            _get(row, "CBS_2") or None,
+            _get(row, "CBS_3") or None,
+            _get(row, "CBS_4") or None,
+            _get(row, "CBS_5") or None,
+            _get(row, "Cost_Type") or None,
+            float(_to_decimal(_get(row, "Submitted_ Actual_Cost"), "Submitted_ Actual_Cost")) if _get(row, "Submitted_ Actual_Cost") else None,
+            float(_to_decimal(_get(row, "Submitted_1_FC"), "Submitted_1_FC")) if _get(row, "Submitted_1_FC") else None,
+            float(_to_decimal(_get(row, "Submitted_2_FC"), "Submitted_2_FC")) if _get(row, "Submitted_2_FC") else None,
+            float(_to_decimal(_get(row, "Submitted_3_FC"), "Submitted_3_FC")) if _get(row, "Submitted_3_FC") else None,
+            float(_to_decimal(_get(row, "Variance_Current_Submission"), "Variance_Current_Submission")) if _get(row, "Variance_Current_Submission") else None,
+          ),
+        )
+
+        budget_at_completion = _get(row, "Budget_at_Completion")
+        overhead = _get(row, "Overhead")
+        profit = _get(row, "Profit")
+        budget_plus_fee = _get(row, "Budget_plus_Fee")
+        submitted_ltd_wo = _get(row, "Submitted_ActualCosts_LTD_without_fees")
+        submitted_ltd_oh = _get(row, "Submitted_ActualCosts_LTD_Overhead")
+        submitted_ltd_fee = _get(row, "Submitted_ActualCosts_LTD_Fee")
+        submitted_ltd_w = _get(row, "Submitted_ActualCosts_LTD_with_fees")
+        certified_ltd_wo = _get(row, "Certified_ActualCosts_LTD_without_fees")
+        certified_ltd_oh = _get(row, "Certified_ActualCosts_LTD_Overhead")
+        certified_ltd_fee = _get(row, "Certified_ActualCosts_LTD_Fee")
+        certified_ltd_w = _get(row, "Certified_ActualCosts_LTD_with_fees")
+        variance_ltd = _get(row, "Variance_LTD")
+        total_variance = _get(row, "Total Variance")
+        variance_at_completion = _get(row, "Variance_at_Completion")
+        estimate_at_completion = _get(row, "Estimate_at_Completion")
+        estimate_to_complete = _get(row, "Estimate_to_Complete")
+        ltd_certified = _get(row, "LTD_Certified_ with_Current_AFP")
+
+        update_params = (
+          _get(row, "Bundle_ID") or None,
+          _get(row, "CBS_1") or None,
+          _get(row, "CBS_2") or None,
+          _get(row, "CBS_3") or None,
+          _get(row, "CBS_4") or None,
+          _get(row, "CBS_5") or None,
+          _get(row, "Cost_Type") or None,
+          float(_to_decimal(budget_at_completion, "Budget_at_Completion")) if budget_at_completion else None,
+          float(_to_decimal(overhead, "Overhead")) if overhead else None,
+          float(_to_decimal(profit, "Profit")) if profit else None,
+          float(_to_decimal(budget_plus_fee, "Budget_plus_Fee")) if budget_plus_fee else None,
+          float(_to_decimal(submitted_ltd_wo, "Submitted_ActualCosts_LTD_without_fees")) if submitted_ltd_wo else None,
+          float(_to_decimal(submitted_ltd_oh, "Submitted_ActualCosts_LTD_Overhead")) if submitted_ltd_oh else None,
+          float(_to_decimal(submitted_ltd_fee, "Submitted_ActualCosts_LTD_Fee")) if submitted_ltd_fee else None,
+          float(_to_decimal(submitted_ltd_w, "Submitted_ActualCosts_LTD_with_fees")) if submitted_ltd_w else None,
+          float(_to_decimal(certified_ltd_wo, "Certified_ActualCosts_LTD_without_fees")) if certified_ltd_wo else None,
+          float(_to_decimal(certified_ltd_oh, "Certified_ActualCosts_LTD_Overhead")) if certified_ltd_oh else None,
+          float(_to_decimal(certified_ltd_fee, "Certified_ActualCosts_LTD_Fee")) if certified_ltd_fee else None,
+          float(_to_decimal(certified_ltd_w, "Certified_ActualCosts_LTD_with_fees")) if certified_ltd_w else None,
+          float(_to_decimal(variance_ltd, "Variance_LTD")) if variance_ltd else None,
+          float(_to_decimal(total_variance, "Total Variance")) if total_variance else None,
+          float(_to_decimal(variance_at_completion, "Variance_at_Completion")) if variance_at_completion else None,
+          float(_to_decimal(estimate_at_completion, "Estimate_at_Completion")) if estimate_at_completion else None,
+          float(_to_decimal(estimate_to_complete, "Estimate_to_Complete")) if estimate_to_complete else None,
+          float(_to_decimal(ltd_certified, "LTD_Certified_ with_Current_AFP")) if ltd_certified else None,
+          itb_no,
+          ln_itm_id,
+        )
+
+        cursor.execute(
+          """
+          UPDATE dbo.itb_line_master
+          SET
+            bundle_id = %s,
+            cbs_1 = %s,
+            cbs_2 = %s,
+            cbs_3 = %s,
+            cbs_4 = %s,
+            cbs_5 = %s,
+            cost_type = %s,
+            budget_at_completion = %s,
+            overhead = %s,
+            profit = %s,
+            budget_plus_fee = %s,
+            submitted_actualcosts_ltd_without_fees = %s,
+            submitted_actualcosts_ltd_overhead = %s,
+            submitted_actualcosts_ltd_fee = %s,
+            submitted_actualcosts_ltd_with_fees = %s,
+            certified_actualcosts_ltd_without_fees = %s,
+            certified_actualcosts_ltd_overhead = %s,
+            certified_actualcosts_ltd_fee = %s,
+            certified_actualcosts_ltd_with_fees = %s,
+            variance_ltd = %s,
+            total_variance = %s,
+            variance_at_completion = %s,
+            estimate_at_completion = %s,
+            estimate_to_complete = %s,
+            ltd_certified_with_current_afp = %s,
+            last_itb_no = %s,
+            updated_at = SYSUTCDATETIME()
+          WHERE ln_itm_id = %s
+          """,
+          update_params,
+        )
+
+        if cursor.rowcount == 0:
+          cursor.execute(
+            """
+            INSERT INTO dbo.itb_line_master (
+              ln_itm_id, bundle_id, cbs_1, cbs_2, cbs_3, cbs_4, cbs_5, cost_type,
+              budget_at_completion, overhead, profit, budget_plus_fee,
+              submitted_actualcosts_ltd_without_fees, submitted_actualcosts_ltd_overhead, submitted_actualcosts_ltd_fee, submitted_actualcosts_ltd_with_fees,
+              certified_actualcosts_ltd_without_fees, certified_actualcosts_ltd_overhead, certified_actualcosts_ltd_fee, certified_actualcosts_ltd_with_fees,
+              variance_ltd, total_variance, variance_at_completion, estimate_at_completion, estimate_to_complete,
+              ltd_certified_with_current_afp, last_itb_no, updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, SYSUTCDATETIME())
+            """,
+            (
+              ln_itm_id,
+              _get(row, "Bundle_ID") or None,
+              _get(row, "CBS_1") or None,
+              _get(row, "CBS_2") or None,
+              _get(row, "CBS_3") or None,
+              _get(row, "CBS_4") or None,
+              _get(row, "CBS_5") or None,
+              _get(row, "Cost_Type") or None,
+              float(_to_decimal(budget_at_completion, "Budget_at_Completion")) if budget_at_completion else None,
+              float(_to_decimal(overhead, "Overhead")) if overhead else None,
+              float(_to_decimal(profit, "Profit")) if profit else None,
+              float(_to_decimal(budget_plus_fee, "Budget_plus_Fee")) if budget_plus_fee else None,
+              float(_to_decimal(submitted_ltd_wo, "Submitted_ActualCosts_LTD_without_fees")) if submitted_ltd_wo else None,
+              float(_to_decimal(submitted_ltd_oh, "Submitted_ActualCosts_LTD_Overhead")) if submitted_ltd_oh else None,
+              float(_to_decimal(submitted_ltd_fee, "Submitted_ActualCosts_LTD_Fee")) if submitted_ltd_fee else None,
+              float(_to_decimal(submitted_ltd_w, "Submitted_ActualCosts_LTD_with_fees")) if submitted_ltd_w else None,
+              float(_to_decimal(certified_ltd_wo, "Certified_ActualCosts_LTD_without_fees")) if certified_ltd_wo else None,
+              float(_to_decimal(certified_ltd_oh, "Certified_ActualCosts_LTD_Overhead")) if certified_ltd_oh else None,
+              float(_to_decimal(certified_ltd_fee, "Certified_ActualCosts_LTD_Fee")) if certified_ltd_fee else None,
+              float(_to_decimal(certified_ltd_w, "Certified_ActualCosts_LTD_with_fees")) if certified_ltd_w else None,
+              float(_to_decimal(variance_ltd, "Variance_LTD")) if variance_ltd else None,
+              float(_to_decimal(total_variance, "Total Variance")) if total_variance else None,
+              float(_to_decimal(variance_at_completion, "Variance_at_Completion")) if variance_at_completion else None,
+              float(_to_decimal(estimate_at_completion, "Estimate_at_Completion")) if estimate_at_completion else None,
+              float(_to_decimal(estimate_to_complete, "Estimate_to_Complete")) if estimate_to_complete else None,
+              float(_to_decimal(ltd_certified, "LTD_Certified_ with_Current_AFP")) if ltd_certified else None,
+              itb_no,
+            ),
+          )
+
+    conn.commit()
+
+  return {"message": "ITB cost performance ingested", "rows": len(rows)}
 
 
-@app.get("/category-limits")
-def get_category_limits():
+@app.post("/cycles/{itb_no}/upload/erp-actuals")
+def upload_erp_actuals(itb_no: str, file: UploadFile = File(...)):
   ensure_schema_exists()
+  rows = _read_csv_upload(file)
+
   with get_sql_connection() as conn:
     with conn.cursor() as cursor:
-      cursor.execute("SELECT category_id, category_limit, total_claimed, updated_at FROM dbo.category_limits ORDER BY category_id")
-      rows = cursor.fetchall()
-  return {"count": len(rows), "records": rows}
+      for row in rows:
+        cost_id = _get(row, "Cost_ID")
+        if not cost_id:
+          continue
+        cursor.execute(
+          """
+          INSERT INTO dbo.input_erp_actuals (
+            itb_no, ln_itm_id, cost_id, bundle_id, cbs_1, cbs_2, cbs_3, cbs_4, cbs_5,
+            vendor_name, reimbursement_type, cost_type, activity, activity_name,
+            cost_id_description, cost_element_category_ref, submitted_acwp, submitted_oh, submitted_profit, submitted_acwp_w_fee
+          )
+          VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+          """,
+          (
+            itb_no,
+            _get(row, "Ln_ITM_ID") or None,
+            cost_id,
+            _get(row, "Bundle_ID") or None,
+            _get(row, "CBS_1") or None,
+            _get(row, "CBS_2") or None,
+            _get(row, "CBS_3") or None,
+            _get(row, "CBS_4") or None,
+            _get(row, "CBS_5") or None,
+            _get(row, "Vendor_Name") or None,
+            _get(row, "Reimbursement_Type") or None,
+            _get(row, "Cost_Type") or None,
+            _get(row, "Activity") or None,
+            _get(row, "Activity_Name") or None,
+            _get(row, "Cost_ID_Description") or None,
+            _get(row, "Cost_Element_Category_Ref") or None,
+            float(_to_decimal(_get(row, "Submitted_ACWP"), "Submitted_ACWP")) if _get(row, "Submitted_ACWP") else None,
+            float(_to_decimal(_get(row, "Submitted_OH"), "Submitted_OH")) if _get(row, "Submitted_OH") else None,
+            float(_to_decimal(_get(row, "Submitted_Profit"), "Submitted_Profit")) if _get(row, "Submitted_Profit") else None,
+            float(_to_decimal(_get(row, "Submitted_ACWP_w_Fee"), "Submitted_ACWP_w_Fee")) if _get(row, "Submitted_ACWP_w_Fee") else None,
+          ),
+        )
+    conn.commit()
+
+  return {"message": "ERP actuals ingested", "rows": len(rows)}
 
 
-@app.get("/records")
-def get_records(
-  limit: int = Query(default=100, ge=1, le=1000),
-  certification: str | None = Query(default=None),
-  project: str | None = Query(default=None),
-  cost_category: str | None = Query(default=None),
-  po: str | None = Query(default=None),
-):
+@app.post("/cycles/{itb_no}/upload/invoice-information")
+def upload_invoice_information(itb_no: str, file: UploadFile = File(...)):
   ensure_schema_exists()
+  rows = _read_csv_upload(file)
 
-  base = """
-    SELECT TOP (%s)
-      id, source_blob, row_number, project, cost_category, po, cost_amount,
-      certification, certified_cost, po_remaining_before, category_remaining_before,
-      error_message, raw_payload, processed_at
-    FROM dbo.application_payments_processed
-  """
-  params: list = [limit]
-  where_parts: list[str] = []
-  if certification:
-    where_parts.append("certification = %s")
-    params.append(certification.strip().lower())
-  if project:
-    where_parts.append("project LIKE %s")
-    params.append(f"%{project.strip()}%")
-  if cost_category:
-    where_parts.append("cost_category LIKE %s")
-    params.append(f"%{cost_category.strip()}%")
-  if po:
-    where_parts.append("po LIKE %s")
-    params.append(f"%{po.strip()}%")
-
-  where = ""
-  if where_parts:
-    where = " WHERE " + " AND ".join(where_parts)
-
-  query = f"{base}{where} ORDER BY id DESC"
   with get_sql_connection() as conn:
     with conn.cursor() as cursor:
-      cursor.execute(query, tuple(params))
-      rows = cursor.fetchall()
+      for row in rows:
+        cost_id = _get(row, "Cost_ID")
+        if not cost_id:
+          continue
+        cursor.execute(
+          """
+          INSERT INTO dbo.input_invoice_information (
+            itb_no, cost_id, vendor_name, actual_or_accrual, invoice_no, invoice_date, po_no,
+            currency, subtotal_amount, fx, amount_cad, claim_amount
+          )
+          VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+          """,
+          (
+            itb_no,
+            cost_id,
+            _get(row, "Vendor Name") or None,
+            _get(row, "Actual/Accruals") or None,
+            _get(row, "Invoice No") or None,
+            _get(row, "Invoice Date") or None,
+            _get(row, "PO No") or None,
+            _get(row, "Currency") or None,
+            float(_to_decimal(_get(row, "Subtotal Amount (Without Tax)"), "Subtotal Amount")) if _get(row, "Subtotal Amount (Without Tax)") else None,
+            float(_to_decimal(_get(row, "FX"), "FX")) if _get(row, "FX") else None,
+            float(_to_decimal(_get(row, "Amount in CAD"), "Amount in CAD")) if _get(row, "Amount in CAD") else None,
+            float(_to_decimal(_get(row, "Claim Amount"), "Claim Amount")) if _get(row, "Claim Amount") else None,
+          ),
+        )
+    conn.commit()
 
-  normalized = []
-  for row in rows:
-    row["raw_payload"] = row.get("raw_payload")
-    normalized.append(row)
-  return {"count": len(normalized), "records": normalized}
+  return {"message": "Invoice information ingested", "rows": len(rows)}
 
 
-@app.get("/raw-inputs")
-def get_raw_inputs(limit: int = Query(default=200, ge=1, le=1000)):
+@app.post("/cycles/{itb_no}/process")
+def process_cycle(itb_no: str):
   ensure_schema_exists()
+
   with get_sql_connection() as conn:
     with conn.cursor() as cursor:
       cursor.execute(
         """
-        SELECT TOP (%s)
-          id, source_blob, row_number, project, cost_category, po, cost_amount, raw_payload, ingested_at
-        FROM dbo.application_payments_raw
-        ORDER BY id DESC
+        MERGE dbo.submission_cycle AS target
+        USING (SELECT %s AS itb_no) AS src
+        ON target.itb_no = src.itb_no
+        WHEN NOT MATCHED THEN
+          INSERT (itb_no) VALUES (%s);
         """,
-        (limit,),
+        (itb_no, itb_no),
       )
+
+      cursor.execute(
+        """
+        SELECT id, cost_id, po_no, amount_cad, claim_amount, vendor_name, actual_or_accrual,
+               invoice_no, invoice_date, currency, subtotal_amount, fx
+        FROM dbo.input_invoice_information
+        WHERE itb_no = %s
+        ORDER BY id
+        """,
+        (itb_no,),
+      )
+      invoice_rows = cursor.fetchall()
+
+      for row in invoice_rows:
+        claim_amount = Decimal(str(row.get("claim_amount") or 0))
+        amount_cad = Decimal(str(row.get("amount_cad") or 0))
+        authorization_status = "authorized"
+
+        if claim_amount <= 0:
+          authorization_status = "invalid_amount"
+          authorized_amount = Decimal("0")
+          unauthorized_amount = claim_amount
+        elif claim_amount > amount_cad:
+          authorization_status = "invalid_amount"
+          authorized_amount = Decimal("0")
+          unauthorized_amount = claim_amount
+        else:
+          cursor.execute(
+            """
+            SELECT po_no, total_claimed, remaining
+            FROM dbo.po_master WITH (UPDLOCK, ROWLOCK)
+            WHERE po_no = %s
+            """,
+            (row.get("po_no"),),
+          )
+          po_row = cursor.fetchone()
+          if not po_row:
+            authorization_status = "deauthorized"
+            authorized_amount = Decimal("0")
+            unauthorized_amount = claim_amount
+          else:
+            remaining = Decimal(str(po_row.get("remaining") or 0))
+            if remaining <= 0:
+              authorization_status = "deauthorized"
+              authorized_amount = Decimal("0")
+              unauthorized_amount = claim_amount
+            else:
+              authorized_amount = min(claim_amount, remaining)
+              unauthorized_amount = claim_amount - authorized_amount
+              if unauthorized_amount > 0:
+                authorization_status = "partially_authorized"
+
+              cursor.execute(
+                """
+                UPDATE dbo.po_master
+                SET total_claimed = total_claimed + %s,
+                    remaining = remaining - %s,
+                    last_itb_no = %s,
+                    updated_at = SYSUTCDATETIME()
+                WHERE po_no = %s
+                """,
+                (float(authorized_amount), float(authorized_amount), itb_no, row.get("po_no")),
+              )
+
+              cursor.execute(
+                """
+                INSERT INTO dbo.txn_po_ledger (itb_no, po_no, claimed_amount, source)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (itb_no, row.get("po_no"), float(authorized_amount), "invoice"),
+              )
+
+        cursor.execute(
+          """
+          INSERT INTO dbo.txn_invoice_information (
+            itb_no, cost_id, vendor_name, actual_or_accrual, invoice_no, invoice_date, po_no,
+            currency, subtotal_amount, fx, amount_cad, claim_amount,
+            authorized_amount, unauthorized_amount, authorization_status
+          )
+          VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+          """,
+          (
+            itb_no,
+            row.get("cost_id"),
+            row.get("vendor_name"),
+            row.get("actual_or_accrual"),
+            row.get("invoice_no"),
+            row.get("invoice_date"),
+            row.get("po_no"),
+            row.get("currency"),
+            row.get("subtotal_amount"),
+            row.get("fx"),
+            row.get("amount_cad"),
+            row.get("claim_amount"),
+            float(authorized_amount),
+            float(unauthorized_amount),
+            authorization_status,
+          ),
+        )
+
+      cursor.execute(
+        """
+        SELECT cost_id, SUM(authorized_amount) AS authorized_total
+        FROM dbo.txn_invoice_information
+        WHERE itb_no = %s
+        GROUP BY cost_id
+        """,
+        (itb_no,),
+      )
+      authorized_by_cost = {row["cost_id"]: Decimal(str(row["authorized_total"] or 0)) for row in cursor.fetchall()}
+      remaining_by_cost = dict(authorized_by_cost)
+
+      cursor.execute(
+        """
+        SELECT * FROM dbo.input_erp_actuals
+        WHERE itb_no = %s
+        ORDER BY id
+        """,
+        (itb_no,),
+      )
+      erp_rows = cursor.fetchall()
+
+      for row in erp_rows:
+        cost_id = row.get("cost_id")
+        authorized_total = remaining_by_cost.get(cost_id, Decimal("0"))
+        submitted_acwp = Decimal(str(row.get("submitted_acwp") or 0))
+        if authorized_total <= 0 or submitted_acwp <= 0:
+          authorized_cost = Decimal("0")
+          status = "deauthorized"
+        else:
+          authorized_cost = min(submitted_acwp, authorized_total)
+          remaining_by_cost[cost_id] = authorized_total - authorized_cost
+          status = "authorized" if authorized_cost == submitted_acwp else "partially_authorized"
+
+        certified_without_fee = authorized_cost
+        certified_overhead = (certified_without_fee * CERT_OVERHEAD_RATE).quantize(Decimal("0.01"))
+        certified_profit = (certified_without_fee * CERT_PROFIT_RATE).quantize(Decimal("0.01"))
+        certified_amount_w_fee = certified_without_fee + certified_overhead + certified_profit
+
+        cursor.execute(
+          """
+          INSERT INTO dbo.txn_erp_actuals (
+            itb_no, ln_itm_id, cost_id, bundle_id, cbs_1, cbs_2, cbs_3, cbs_4, cbs_5,
+            vendor_name, reimbursement_type, cost_type, activity, activity_name,
+            cost_id_description, cost_element_category_ref,
+            submitted_acwp, submitted_oh, submitted_profit, submitted_acwp_w_fee,
+            authorized_cost_amount, certification_status,
+            certified_without_fee, certified_overhead, certified_profit, certified_amount_w_fee
+          )
+          VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+          """,
+          (
+            itb_no,
+            row.get("ln_itm_id"),
+            cost_id,
+            row.get("bundle_id"),
+            row.get("cbs_1"),
+            row.get("cbs_2"),
+            row.get("cbs_3"),
+            row.get("cbs_4"),
+            row.get("cbs_5"),
+            row.get("vendor_name"),
+            row.get("reimbursement_type"),
+            row.get("cost_type"),
+            row.get("activity"),
+            row.get("activity_name"),
+            row.get("cost_id_description"),
+            row.get("cost_element_category_ref"),
+            row.get("submitted_acwp"),
+            row.get("submitted_oh"),
+            row.get("submitted_profit"),
+            row.get("submitted_acwp_w_fee"),
+            float(authorized_cost),
+            status,
+            float(certified_without_fee),
+            float(certified_overhead),
+            float(certified_profit),
+            float(certified_amount_w_fee),
+          ),
+        )
+
+      cursor.execute(
+        """
+        SELECT ln_itm_id,
+               SUM(COALESCE(submitted_acwp, 0)) AS submitted_actual_cost,
+               SUM(COALESCE(authorized_cost_amount, 0)) AS certified_actual_cost
+        FROM dbo.txn_erp_actuals
+        WHERE itb_no = %s
+        GROUP BY ln_itm_id
+        """,
+        (itb_no,),
+      )
+      erp_totals = {row["ln_itm_id"]: row for row in cursor.fetchall()}
+
+      cursor.execute(
+        """
+        SELECT * FROM dbo.input_itb_cost_performance
+        WHERE itb_no = %s
+        ORDER BY id
+        """,
+        (itb_no,),
+      )
+      itb_rows = cursor.fetchall()
+
+      for row in itb_rows:
+        ln_itm_id = row.get("ln_itm_id")
+        totals = erp_totals.get(ln_itm_id, {"submitted_actual_cost": 0, "certified_actual_cost": 0})
+        submitted_actual_cost_calc = Decimal(str(totals.get("submitted_actual_cost") or 0))
+        certified_actual_cost = Decimal(str(totals.get("certified_actual_cost") or 0))
+
+        cursor.execute(
+          """
+          SELECT ltd_certified_with_current_afp
+          FROM dbo.itb_line_master
+          WHERE ln_itm_id = %s
+          """,
+          (ln_itm_id,),
+        )
+        prior = cursor.fetchone()
+        prior_ltd = Decimal(str(prior.get("ltd_certified_with_current_afp") or 0)) if prior else Decimal("0")
+        ltd = prior_ltd + certified_actual_cost
+
+        forecast_total = None
+        if row.get("submitted_1_fc") is not None or row.get("submitted_2_fc") is not None or row.get("submitted_3_fc") is not None:
+          forecast_total = (
+            Decimal(str(row.get("submitted_1_fc") or 0)) +
+            Decimal(str(row.get("submitted_2_fc") or 0)) +
+            Decimal(str(row.get("submitted_3_fc") or 0))
+          )
+
+        cursor.execute(
+          """
+          INSERT INTO dbo.txn_itb_cost_performance (
+            itb_no, ln_itm_id, bundle_id, cbs_1, cbs_2, cbs_3, cbs_4, cbs_5, cost_type,
+            submitted_actual_cost, submitted_1_fc, submitted_2_fc, submitted_3_fc, variance_current_submission,
+            forecast_total, submitted_actual_cost_calc, certified_actual_cost, ltd_certified_with_current_afp
+          )
+          VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+          """,
+          (
+            itb_no,
+            ln_itm_id,
+            row.get("bundle_id"),
+            row.get("cbs_1"),
+            row.get("cbs_2"),
+            row.get("cbs_3"),
+            row.get("cbs_4"),
+            row.get("cbs_5"),
+            row.get("cost_type"),
+            row.get("submitted_actual_cost"),
+            row.get("submitted_1_fc"),
+            row.get("submitted_2_fc"),
+            row.get("submitted_3_fc"),
+            row.get("variance_current_submission"),
+            float(forecast_total) if forecast_total is not None else None,
+            float(submitted_actual_cost_calc),
+            float(certified_actual_cost),
+            float(ltd),
+          ),
+        )
+
+        cursor.execute(
+          """
+          UPDATE dbo.itb_line_master
+          SET ltd_certified_with_current_afp = %s,
+              last_itb_no = %s,
+              updated_at = SYSUTCDATETIME()
+          WHERE ln_itm_id = %s
+          """,
+          (float(ltd), itb_no, ln_itm_id),
+        )
+
+    conn.commit()
+
+  return {"message": "Cycle processed", "itb_no": itb_no}
+
+
+@app.get("/txn/invoices")
+def get_txn_invoices(itb_no: str = Query(...)):
+  ensure_schema_exists()
+  with get_sql_connection() as conn:
+    with conn.cursor() as cursor:
+      cursor.execute("SELECT * FROM dbo.txn_invoice_information WHERE itb_no = %s", (itb_no,))
+      rows = cursor.fetchall()
+  return {"count": len(rows), "records": rows}
+
+
+@app.get("/txn/erp")
+def get_txn_erp(itb_no: str = Query(...)):
+  ensure_schema_exists()
+  with get_sql_connection() as conn:
+    with conn.cursor() as cursor:
+      cursor.execute("SELECT * FROM dbo.txn_erp_actuals WHERE itb_no = %s", (itb_no,))
+      rows = cursor.fetchall()
+  return {"count": len(rows), "records": rows}
+
+
+@app.get("/txn/itb")
+def get_txn_itb(itb_no: str = Query(...)):
+  ensure_schema_exists()
+  with get_sql_connection() as conn:
+    with conn.cursor() as cursor:
+      cursor.execute("SELECT * FROM dbo.txn_itb_cost_performance WHERE itb_no = %s", (itb_no,))
+      rows = cursor.fetchall()
+  return {"count": len(rows), "records": rows}
+
+
+@app.get("/po-master")
+def get_po_master():
+  ensure_schema_exists()
+  with get_sql_connection() as conn:
+    with conn.cursor() as cursor:
+      cursor.execute("SELECT * FROM dbo.po_master ORDER BY po_no")
+      rows = cursor.fetchall()
+  return {"count": len(rows), "records": rows}
+
+
+@app.get("/itb-line-master")
+def get_itb_line_master(limit: int = Query(default=200, ge=1, le=5000)):
+  ensure_schema_exists()
+  with get_sql_connection() as conn:
+    with conn.cursor() as cursor:
+      cursor.execute("SELECT TOP (%s) * FROM dbo.itb_line_master ORDER BY ln_itm_id", (limit,))
       rows = cursor.fetchall()
   return {"count": len(rows), "records": rows}
