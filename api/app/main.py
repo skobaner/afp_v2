@@ -81,6 +81,26 @@ def _get(row: dict[str, str], *keys: str, default: str = "") -> str:
   return default
 
 
+def _parse_date(value: str | None, field_name: str):
+  if value is None:
+    return None
+  raw = str(value).strip()
+  if raw == "":
+    return None
+
+  formats = ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%m/%d/%y", "%d-%b-%y")
+  for fmt in formats:
+    try:
+      return datetime.strptime(raw, fmt).date()
+    except ValueError:
+      continue
+
+  try:
+    return datetime.fromisoformat(raw).date()
+  except ValueError:
+    raise HTTPException(status_code=400, detail=f"Invalid date value for {field_name}: {value}")
+
+
 def _validate_readonly_sql(sql: str) -> str:
   normalized = " ".join(sql.strip().split())
   if not normalized:
@@ -469,7 +489,7 @@ def upload_invoice_information(itb_no: str, file: UploadFile = File(...)):
             _get(row, "Vendor Name") or None,
             _get(row, "Actual/Accruals") or None,
             _get(row, "Invoice No") or None,
-            _get(row, "Invoice Date") or None,
+            _parse_date(_get(row, "Invoice Date"), "Invoice Date"),
             _get(row, "PO No") or None,
             _get(row, "Currency") or None,
             float(_to_decimal(_get(row, "Subtotal Amount (Without Tax)"), "Subtotal Amount")) if _get(row, "Subtotal Amount (Without Tax)") else None,
