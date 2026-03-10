@@ -57,7 +57,11 @@ def _to_decimal(value: str | None, field_name: str) -> Decimal:
     raw = str(value).strip()
     if raw == "":
       return Decimal("0")
+    if raw in {"-", "—", "–", "N/A", "NA", "n/a", "na"}:
+      return Decimal("0")
     cleaned = raw.replace(",", "").replace("$", "").replace("CAD", "").strip()
+    if cleaned in {"-", "—", "–", "N/A", "NA", "n/a", "na"}:
+      return Decimal("0")
     if cleaned.startswith("(") and cleaned.endswith(")"):
       cleaned = f"-{cleaned[1:-1].strip()}"
     return Decimal(cleaned)
