@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 app = FastAPI(title="AFP Data Platform API", version="2.0.0")
 APP_ROOT = Path(__file__).resolve().parent
 STATIC_DIR = APP_ROOT / "static"
-SCHEMA_PATH = APP_ROOT.parents[2] / "sql" / "schema.sql"
+SCHEMA_PATH = APP_ROOT / "schema.sql"
 
 CERT_OVERHEAD_RATE = Decimal("0.151")
 CERT_PROFIT_RATE = Decimal("0.132")
