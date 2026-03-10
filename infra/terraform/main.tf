@@ -117,10 +117,10 @@ resource "azurerm_linux_web_app" "api" {
     BLOB_CONNECTION_STRING = azurerm_storage_account.main.primary_connection_string
     BLOB_CONTAINER_NAME    = azurerm_storage_container.input.name
 
-    SQL_HOST     = azurerm_mssql_server.main.fully_qualified_domain_name
-    SQL_DATABASE = azurerm_mssql_database.main.name
-    SQL_USER     = var.sql_admin_username
-    SQL_PASSWORD = var.sql_admin_password
+    SQL_HOST           = azurerm_mssql_server.main.fully_qualified_domain_name
+    SQL_DATABASE       = azurerm_mssql_database.main.name
+    SQL_USER           = var.sql_admin_username
+    SQL_PASSWORD       = var.sql_admin_password
     CORS_ALLOW_ORIGINS = "*"
   }
 
