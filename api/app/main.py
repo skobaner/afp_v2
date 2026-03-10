@@ -54,7 +54,13 @@ def _required_env(name: str) -> str:
 
 def _to_decimal(value: str | None, field_name: str) -> Decimal:
   try:
-    return Decimal(str(value).strip())
+    raw = str(value).strip()
+    if raw == "":
+      return Decimal("0")
+    cleaned = raw.replace(",", "").replace("$", "").replace("CAD", "").strip()
+    if cleaned.startswith("(") and cleaned.endswith(")"):
+      cleaned = f"-{cleaned[1:-1].strip()}"
+    return Decimal(cleaned)
   except (InvalidOperation, ValueError, TypeError):
     raise HTTPException(status_code=400, detail=f"Invalid decimal value for {field_name}: {value}")
 
