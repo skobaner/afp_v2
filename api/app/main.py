@@ -19,15 +19,17 @@ CERT_OVERHEAD_RATE = Decimal("0.151")
 CERT_PROFIT_RATE = Decimal("0.132")
 
 CORS_ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "*")
+cors_allow_credentials = True
 if CORS_ALLOW_ORIGINS.strip() == "*":
   cors_origins = ["*"]
+  cors_allow_credentials = False
 else:
   cors_origins = [origin.strip() for origin in CORS_ALLOW_ORIGINS.split(",") if origin.strip()]
 
 app.add_middleware(
   CORSMiddleware,
   allow_origins=cors_origins,
-  allow_credentials=True,
+  allow_credentials=cors_allow_credentials,
   allow_methods=["*"],
   allow_headers=["*"],
 )
